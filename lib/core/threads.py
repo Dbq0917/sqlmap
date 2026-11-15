@@ -64,6 +64,7 @@ class _ThreadData(threading.local):
         self.lastPage = None
         self.lastRequestMsg = None
         self.lastRequestUID = 0
+        self.lastRequestTimedOut = False
         self.lastRedirectURL = tuple()
         self.random = WichmannHill()
         self.resumed = False

@@ -116,6 +116,16 @@ PARAMETER_MINING_BUCKET_SIZE = 25
 # For filling in case of dumb push updates
 DUMMY_JUNK = "rie8kooZ"
 
+# Detection is a decision procedure, not a race: a transport timeout is UNKNOWN, not a
+# negative observation. An indeterminate probe is replayed once with the exact same
+# payload, so a transient timeout cannot flip the verdict while a clean scan still
+# issues exactly one request per probe (no whole-scan duplication, no doubled runtime).
+DETECTION_INDETERMINATE_RETRIES = 1
+
+# Number of attempts for each assertion in the false-positive confirmation. The second
+# attempt only happens when the first is indeterminate (timeout/connection failure).
+FALSE_POSITIVE_CONTROL_ATTEMPTS = 2
+
 # Markers for special cases when parameter values contain html encoded characters
 PARAMETER_AMP_MARKER = "__PARAMETER_AMP__"
 PARAMETER_SEMICOLON_MARKER = "__PARAMETER_SEMICOLON__"

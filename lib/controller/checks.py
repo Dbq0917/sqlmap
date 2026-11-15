@@ -6,6 +6,7 @@ See the file 'LICENSE' for copying permission
 """
 
 import copy
+import hashlib
 import logging
 import random
 import re
@@ -79,7 +80,9 @@ from lib.core.settings import CHECK_INTERNET_ADDRESS
 from lib.core.settings import CHECK_INTERNET_CODE
 from lib.core.settings import DEFAULT_COOKIE_DELIMITER
 from lib.core.settings import DEFAULT_GET_POST_DELIMITER
+from lib.core.settings import DETECTION_INDETERMINATE_RETRIES
 from lib.core.settings import DUMMY_NON_SQLI_CHECK_APPENDIX
+from lib.core.settings import FALSE_POSITIVE_CONTROL_ATTEMPTS
 from lib.core.settings import FI_ERROR_REGEX
 from lib.core.settings import FORMAT_EXCEPTION_STRINGS
 from lib.core.settings import GRAPHQL_ERROR_REGEX
@@ -123,7 +126,112 @@ from lib.techniques.union.use import configUnion
 from thirdparty import six
 from thirdparty.six.moves import http_client as _http_client
 
+def _detectionSeed(place, parameter):
+    """
+    A stable seed for every probe generated while testing one injection point.
+
+    Payload placeholders (RANDNUM/RANDSTR/...) are otherwise drawn from a process-wide
+    RNG whose state depends on whatever ran before. Seeding that RNG from a hash of
+    (target, place, parameter) makes two runs emit the same probe sequence, so a
+    verdict can be reproduced and a winning probe replayed byte-for-byte.
+    """
+
+    values = [conf.get(_) for _ in ("hostname", "port", "path", "method")] + [place, parameter]
+    material = "\x00".join(getUnicode(_ or "") for _ in values)
+    return int(hashlib.sha256(material.encode("utf-8")).hexdigest()[:16], 16)
+
+def _deterministicTestValues(seed, level, ordinal=0):
+    """
+    Three strictly increasing, page-marker-safe control values for one false-positive
+    round. They are derived from the injection-point seed instead of fresh random draws,
+    so the same experiment can be repeated and audited.
+    """
+
+    while True:
+        digest = bytearray(hashlib.sha256(("%s|%d|%d" % (seed, level, ordinal)).encode("utf-8")).digest())
+        values = sorted(2 + _ % 97 for _ in digest[:3])
+
+        if len(set(values)) == 3:
+            return tuple(values)
+
+        ordinal += 1
+
+def _isDetectionIndeterminate(result, kwargs):
+    """
+    True only when the backend did not answer (timeout/transport failure), as opposed
+    to answering with a definite negative observation. None from a boolean comparison
+    caused by a DBMS error is NOT indeterminate: that page was actually received.
+    """
+
+    threadData = getCurrentThreadData()
+
+    if getattr(threadData, "lastRequestTimedOut", False):
+        return True
+
+    if kwargs.get("content"):
+        return isinstance(result, tuple) and bool(result) and result[0] is None
+
+    return result is None and threadData.lastComparisonPage is None
+
+def _queryPageStable(payload, place, **kwargs):
+    """
+    Issue the request, and replay the EXACT same payload once only when the first
+    attempt is indeterminate. Definitive True/False observations return immediately,
+    so a clean scan has no extra traffic and cannot approach 2x its runtime.
+    """
+
+    result = Request.queryPage(payload, place, **kwargs)
+
+    for _ in xrange(DETECTION_INDETERMINATE_RETRIES):
+        if not _isDetectionIndeterminate(result, kwargs):
+            break
+        result = Request.queryPage(payload, place, **kwargs)
+
+    if _isDetectionIndeterminate(result, kwargs):
+        kb.detectionIndeterminate = True
+
+    return result
+
+def _checkBooleanStable(expression):
+    """
+    A tri-state control assertion that retries an indeterminate answer with the same
+    expression. It returns True/False for a real answer and None only after every
+    attempt failed to obtain one.
+    """
+
+    result = None
+
+    for _ in xrange(FALSE_POSITIVE_CONTROL_ATTEMPTS):
+        result = checkBooleanExpression(expression)
+        if result is not None:
+            break
+
+    return result
+
 def checkSqlInjection(place, parameter, value):
+    """
+    Stable entry point: fix the probe sequence for this injection point before any
+    payload is forged, then run the ordinary detection controller.
+
+    randomInt()/randomStr() draw from the process-wide RNG when called without an
+    explicit seed, so two runs of the same point used to get different payloads and
+    different false-positive control values. Reseeding from a hash of the point makes
+    the sequence reproducible; the previous RNG state is restored afterwards so the
+    reseed cannot leak into unrelated work.
+    """
+
+    seed = _detectionSeed(place, parameter)
+    kb.detectionSeed = seed
+    kb.detectionIndeterminate = False
+    randomState = random.getstate()
+    random.seed(seed)
+
+    try:
+        return _checkSqlInjection(place, parameter, value)
+    finally:
+        random.setstate(randomState)
+
+def _checkSqlInjection(place, parameter, value):
     # Store here the details about boundaries and payload used to
     # successfully inject
     injection = InjectionDict()
@@ -540,7 +648,7 @@ def checkSqlInjection(place, parameter, value):
                             kb.trueLength = None
                             kb.negativeLogic = (where == PAYLOAD.WHERE.NEGATIVE)
                             suggestion = None
-                            Request.queryPage(genCmpPayload(), place, raise404=False)
+                            _queryPageStable(genCmpPayload(), place, raise404=False)
                             falsePage, falseHeaders, falseCode = threadData.lastComparisonPage or "", threadData.lastComparisonHeaders, threadData.lastComparisonCode
                             falseRawResponse = "%s%s" % (falseHeaders, falsePage)
 
@@ -561,7 +669,7 @@ def checkSqlInjection(place, parameter, value):
                                     pass
 
                             # Perform the test's True request
-                            trueResult = Request.queryPage(reqPayload, place, raise404=False)
+                            trueResult = _queryPageStable(reqPayload, place, raise404=False)
                             truePage, trueHeaders, trueCode = threadData.lastComparisonPage or "", threadData.lastComparisonHeaders, threadData.lastComparisonCode
                             trueRawResponse = "%s%s" % (trueHeaders, truePage)
 
@@ -572,7 +680,7 @@ def checkSqlInjection(place, parameter, value):
 
                             if trueResult and not (truePage == falsePage and not any((kb.nullConnection, conf.code))):
                                 # Perform the test's False request
-                                falseResult = Request.queryPage(genCmpPayload(), place, raise404=False)
+                                falseResult = _queryPageStable(genCmpPayload(), place, raise404=False)
 
                                 if not falseResult:
                                     if kb.negativeLogic:
@@ -580,7 +688,7 @@ def checkSqlInjection(place, parameter, value):
                                         boundPayload = agent.suffixQuery(boundPayload, comment, suffix, where)
                                         errorPayload = agent.payload(place, parameter, newValue=boundPayload, where=where)
 
-                                        errorResult = Request.queryPage(errorPayload, place, raise404=False)
+                                        errorResult = _queryPageStable(errorPayload, place, raise404=False)
                                         if errorResult:
                                             continue
                                     elif kb.heuristicPage and not any((conf.string, conf.notString, conf.regexp, conf.code, conf.lengths, kb.nullConnection)):
@@ -590,7 +698,7 @@ def checkSqlInjection(place, parameter, value):
                                             logger.debug("adjusting match ratio for current parameter to %.3f" % kb.matchRatio)
 
                                     # Reducing false-positive "appears" messages in heavily dynamic environment
-                                    if kb.heavilyDynamic and not Request.queryPage(reqPayload, place, raise404=False):
+                                    if kb.heavilyDynamic and not _queryPageStable(reqPayload, place, raise404=False):
                                         continue
 
                                     injectable = True
@@ -688,7 +796,7 @@ def checkSqlInjection(place, parameter, value):
                             # Perform the test's request and grep the response
                             # body for the test's <grep> regular expression
                             try:
-                                page, headers, _ = Request.queryPage(reqPayload, place, content=True, raise404=False)
+                                page, headers, _ = _queryPageStable(reqPayload, place, content=True, raise404=False)
                                 output = extractRegexResult(check, page, re.DOTALL | re.IGNORECASE)
                                 output = output or extractRegexResult(check, threadData.lastHTTPError[2] if wasLastResponseHTTPError() else None, re.DOTALL | re.IGNORECASE)
                                 output = output or extractRegexResult(check, listToStrValue((headers[key] for key in headers if key.lower() != URI_HTTP_HEADER.lower()) if headers else None), re.DOTALL | re.IGNORECASE)
@@ -713,18 +821,18 @@ def checkSqlInjection(place, parameter, value):
                         # SQL injections
                         elif method == PAYLOAD.METHOD.TIME:
                             # Perform the test's request
-                            trueResult = Request.queryPage(reqPayload, place, timeBasedCompare=True, raise404=False)
+                            trueResult = _queryPageStable(reqPayload, place, timeBasedCompare=True, raise404=False)
                             trueCode = threadData.lastCode
 
                             if trueResult:
                                 # Extra validation step (e.g. to check for DROP protection mechanisms)
                                 if SLEEP_TIME_MARKER in reqPayload:
-                                    falseResult = Request.queryPage(reqPayload.replace(SLEEP_TIME_MARKER, "0"), place, timeBasedCompare=True, raise404=False)
+                                    falseResult = _queryPageStable(reqPayload.replace(SLEEP_TIME_MARKER, "0"), place, timeBasedCompare=True, raise404=False)
                                     if falseResult:
                                         continue
 
                                 # Confirm test's results
-                                trueResult = Request.queryPage(reqPayload, place, timeBasedCompare=True, raise404=False)
+                                trueResult = _queryPageStable(reqPayload, place, timeBasedCompare=True, raise404=False)
 
                                 if trueResult:
                                     infoMsg = "%sparameter '%s' appears to be '%s' injectable " % ("%s " % paramType if paramType != parameter else "", parameter, title)
@@ -976,6 +1084,7 @@ def checkFalsePositives(injection):
     """
 
     retVal = True
+    inconclusive = False
 
     if all(_ in (PAYLOAD.TECHNIQUE.BOOLEAN, PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED) for _ in injection.data) or (len(injection.data) == 1 and PAYLOAD.TECHNIQUE.UNION in injection.data and "Generic" in injection.data[PAYLOAD.TECHNIQUE.UNION].title):
         pushValue(kb.injection)
@@ -984,49 +1093,80 @@ def checkFalsePositives(injection):
         infoMsg += "parameter '%s' is a false positive" % injection.parameter
         logger.info(infoMsg)
 
-        def _():
-            return int(randomInt(2)) + 1
-
         kb.injection = injection
+        kb.falsePositiveCheckInconclusive = False
+        seed = _detectionSeed(injection.place, injection.parameter)
 
         for level in xrange(conf.level):
+            ordinal = 0
             while True:
-                randInt1, randInt2, randInt3 = (_() for j in xrange(3))
-
-                randInt1 = min(randInt1, randInt2, randInt3)
-                randInt3 = max(randInt1, randInt2, randInt3)
+                randInt1, randInt2, randInt3 = _deterministicTestValues(seed, level, ordinal)
 
                 if conf.string and any(conf.string in getUnicode(_) for _ in (randInt1, randInt2, randInt3)):
+                    ordinal += 1
                     continue
 
                 if conf.notString and any(conf.notString in getUnicode(_) for _ in (randInt1, randInt2, randInt3)):
+                    ordinal += 1
                     continue
 
-                if randInt3 > randInt2 > randInt1:
-                    break
+                break
 
-            if not checkBooleanExpression("%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt1)):
+            def _control(expected, expression):
+                result = _checkBooleanStable(expression)
+                return None if result is None else bool(result) is expected
+
+            # A timeout is UNKNOWN, not a failed assertion: treating it as False would erase a
+            # genuinely detected point on a transient network hiccup (the source of run-to-run
+            # "injectable / not injectable" flips).
+            matched = _control(True, "%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt1))
+            if matched is None:
+                inconclusive = True
+                break
+            elif not matched:
                 retVal = False
                 break
 
             if PAYLOAD.TECHNIQUE.BOOLEAN not in injection.data:
-                checkBooleanExpression("%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt2))          # just in case if DBMS hasn't properly recovered from previous delayed request
+                _checkBooleanStable("%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt2))          # just in case if DBMS hasn't properly recovered from previous delayed request
 
-            if checkBooleanExpression("%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt3)):          # this must not be evaluated to True
+            matched = _control(False, "%d%s%d" % (randInt1, INFERENCE_EQUALS_CHAR, randInt3))          # this must not be evaluated to True
+            if matched is None:
+                inconclusive = True
+                break
+            elif not matched:
                 retVal = False
                 break
 
-            elif checkBooleanExpression("%d%s%d" % (randInt3, INFERENCE_EQUALS_CHAR, randInt2)):        # this must not be evaluated to True
+            matched = _control(False, "%d%s%d" % (randInt3, INFERENCE_EQUALS_CHAR, randInt2))          # this must not be evaluated to True
+            if matched is None:
+                inconclusive = True
+                break
+            elif not matched:
                 retVal = False
                 break
 
-            elif not checkBooleanExpression("%d%s%d" % (randInt2, INFERENCE_EQUALS_CHAR, randInt2)):    # this must be evaluated to True
+            matched = _control(True, "%d%s%d" % (randInt2, INFERENCE_EQUALS_CHAR, randInt2))           # this must be evaluated to True
+            if matched is None:
+                inconclusive = True
+                break
+            elif not matched:
                 retVal = False
                 break
 
-            elif checkBooleanExpression("%d %d" % (randInt3, randInt2)):                                # this must not be evaluated to True (invalid statement)
+            matched = _control(False, "%d %d" % (randInt3, randInt2))                                  # this must not be evaluated to True (invalid statement)
+            if matched is None:
+                inconclusive = True
+                break
+            elif not matched:
                 retVal = False
                 break
+
+        if inconclusive:
+            kb.falsePositiveCheckInconclusive = True
+            warnMsg = "false-positive check was inconclusive because the target did not "
+            warnMsg += "answer every control request (timeout); keeping the detected injection point"
+            logger.warning(warnMsg)
 
         if not retVal:
             warnMsg = "false positive or unexploitable injection point detected"

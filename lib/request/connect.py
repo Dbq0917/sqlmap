@@ -365,6 +365,7 @@ class Connect(object):
         start = time.time()
 
         threadData = getCurrentThreadData()
+        threadData.lastRequestTimedOut = False
         with kb.locks.request:
             kb.requestCounter += 1
             threadData.lastRequestUID = requestUID = kb.requestCounter
@@ -914,6 +915,7 @@ class Connect(object):
                 responseHeaders = patchHeaders(responseHeaders)
                 page = decodePage(page, responseHeaders.get(HTTP_HEADER.CONTENT_ENCODING), responseHeaders.get(HTTP_HEADER.CONTENT_TYPE), percentDecode=not crawling)
             except socket.timeout:
+                threadData.lastRequestTimedOut = True
                 warnMsg = "connection timed out while trying "
                 warnMsg += "to get error page information (%d)" % ex.code
                 logger.warning(warnMsg)
@@ -994,6 +996,7 @@ class Connect(object):
                         debugMsg = "page not found (%d)" % code
                         singleTimeLogMessage(debugMsg, logging.DEBUG)
                 elif ex.code == _http_client.GATEWAY_TIMEOUT:
+                    threadData.lastRequestTimedOut = True
                     if ignoreTimeout:
                         return None if not conf.ignoreTimeouts else "", None, None
                     else:
@@ -1035,6 +1038,7 @@ class Connect(object):
             elif any(_ in tbMsg for _ in ("forcibly closed", "Connection is already closed", "ConnectionAbortedError")):
                 warnMsg = "connection was forcibly closed by the target URL"
             elif "timed out" in tbMsg:
+                threadData.lastRequestTimedOut = True
                 if kb.testMode and kb.testType not in (None, PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED):
                     singleTimeWarnMessage("there is a possibility that the target (or WAF/IPS) is dropping 'suspicious' requests")
                     kb.droppingRequests = True
@@ -1098,6 +1102,7 @@ class Connect(object):
                 logger.critical(warnMsg)
                 return None, None, None
             elif ignoreTimeout and any(_ in tbMsg for _ in ("timed out", "IncompleteRead", "Interrupted system call")):
+                threadData.lastRequestTimedOut = True
                 return None if not conf.ignoreTimeouts else "", None, None
             elif threadData.retriesCount < conf.retries and not kb.threadException:
                 warnMsg += ". sqlmap is going to retry the request"
